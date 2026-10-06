@@ -7,7 +7,8 @@ from typing import Union, Optional, List
 
 import yt_dlp
 
-from app.downloaders.base import Downloader, DownloadQuality, QUALITY_MAP
+from app.downloaders.base import Downloader, DownloadQuality, QUALITY_MAP, YDL_RETRY_OPTS
+from app.downloaders.bilibili_dm_patch import apply_bilibili_dm_img_patch
 from app.downloaders.bilibili_subtitle import BilibiliSubtitleFetcher
 from app.models.notes_model import AudioDownloadResult
 from app.models.transcriber_model import TranscriptResult, TranscriptSegment
@@ -16,6 +17,11 @@ from app.utils.url_parser import extract_video_id
 from app.services.cookie_manager import CookieConfigManager
 
 logger = logging.getLogger(__name__)
+
+# Inject the dm_img_* / web_location risk-control params Bilibili's wbi/playurl
+# gateway now requires; without them the API path returns HTTP 412. See
+# app/downloaders/bilibili_dm_patch.py for details.
+apply_bilibili_dm_img_patch()
 
 
 class BilibiliDownloader(Downloader, ABC):
@@ -57,6 +63,7 @@ class BilibiliDownloader(Downloader, ABC):
         output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
 
         ydl_opts = {
+            **YDL_RETRY_OPTS,
             'format': 'bestaudio[ext=m4a]/bestaudio/best',
             'outtmpl': output_path,
             'http_headers': {'Referer': 'https://www.bilibili.com'},
@@ -116,6 +123,7 @@ class BilibiliDownloader(Downloader, ABC):
         output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
 
         ydl_opts = {
+            **YDL_RETRY_OPTS,
             'format': 'bv*[ext=mp4]/bestvideo+bestaudio/best',
             'outtmpl': output_path,
             'http_headers': {'Referer': 'https://www.bilibili.com'},
@@ -177,6 +185,7 @@ class BilibiliDownloader(Downloader, ABC):
         video_id = extract_video_id(video_url, "bilibili")
 
         ydl_opts = {
+            **YDL_RETRY_OPTS,
             'writesubtitles': True,
             'writeautomaticsub': True,
             'subtitleslangs': langs,

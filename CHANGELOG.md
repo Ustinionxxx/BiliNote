@@ -2,6 +2,36 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.4] - 2026-06-23
+
+### Security
+
+- **升级 Starlette 0.46.1 → 0.47.2 修复 CVE-2025-54121**（[GHSA-2c2j-9gv5-cj73](https://github.com/advisories/GHSA-2c2j-9gv5-cj73)，#411）：旧版在解析 multipart 表单中的大文件时，`SpooledTemporaryFile` 从内存溢写到磁盘的 rollover 在事件循环线程内**同步执行**，攻击者可借大文件上传阻塞事件循环造成拒绝服务（DoS）。新版把该写入移到线程池。FastAPI 同步升级 0.115.12 → 0.116.2（其 starlette 约束由 `<0.47.0` 放宽，以容纳修复版本），与现有 pydantic / anyio / python-multipart 均兼容。
+
+## [2.4.3] - 2026-06-23
+
+### Fixed
+
+- **Whisper `large-v3-turbo` 模型无法下载**（#402）：内置映射指向的 `Systran/faster-whisper-large-v3-turbo` 仓库已从 HuggingFace 下架（返回 401/404），点击下载会静默失败、状态一直显示「未下载」。改用社区维护的 CT2 转换版 `deepdml/faster-whisper-large-v3-turbo-ct2`（直链可达、含 `model.bin`，与 faster-whisper 的 `large-v3-turbo` 等价）。
+- **模型下载失败时前端无任何提示**（#402 衍生）：`/transcriber_models_status` 此前只回传 `downloading`/`downloaded`，后台下载失败状态被丢弃。现新增 `model_download_state` 统一维护下载状态与失败原因，状态接口新增 `failed` 字段并透传 `error`；前端模型列表展示「下载失败」徽标 + 错误详情，按钮变为「重试」，并对新出现的失败弹出提示。
+
+## [2.4.2] - 2026-06-17
+
+### Fixed
+
+- **Docker 部署打开显示 nginx 欢迎页**：`nginx/default.conf` 被 docker-compose（多容器）与 `Dockerfile.complete`（单镜像）共用，但两种模式对 `location /` 的需求相反（多容器需反代独立的 frontend 容器，单镜像需直接服务本地静态文件），导致其中一种部署方式总会回退到 nginx 默认欢迎页。现拆分为两份配置：`nginx/default.conf`（compose，反代 frontend 容器）与新增的 `nginx/standalone.conf`（单镜像，静态前端 + 本地 backend 代理）；`Dockerfile.complete` 改用后者并删除 Debian 默认站点，两种部署方式均恢复正常。
+
+## [2.4.1] - 2026-06-17
+
+### Added
+
+- **YouTube Shorts 链接支持**：后端 URL 校验与 video id 提取支持 `youtube.com/shorts/<id>` 形态，Shorts 链接可正常提交生成笔记（#381）。
+
+### Fixed
+
+- **B 站 412（wbi/playurl 风控）**：B 站 `x/player/wbi/playurl` 网关新增 `dm_img_list`/`dm_img_str`/`dm_cover_img_str`/`dm_img_inter` + `web_location` 风控校验，缺失即返回 HTTP 412。多数视频网页内嵌 playinfo、yt-dlp 不调此 API；而网页不内嵌 playinfo、必须走 API 的视频（如 BV1X9L16oEgB）会撞上风控，刷新 cookie 无效、yt-dlp（含最新版）上游尚未适配。现于 wbi 签名前注入哑值 dm_img 风控参数（形态对齐 yt-dlp 自身 arc/search 用法）恢复 200（#410）。
+- **B 站分 P 视频字幕取错集**：分 P 视频提交 `?p=N` 时，字幕优先链路未透传 p 参数，始终取第 1 集 cid，导致笔记内容与实际下载的 p=N 音频不一致。现从 `data.pages[N-1]` 取对应分 P 的 cid（#409）。
+
 ## [2.4.0] - 2026-06-07
 
 ### Added

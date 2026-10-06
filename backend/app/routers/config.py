@@ -11,6 +11,7 @@ from app.utils.path_helper import get_model_dir
 
 from app.services.cookie_manager import CookieConfigManager
 from app.services.transcriber_config_manager import TranscriberConfigManager
+from app.transcriber import model_download_state as dl_state
 from ffmpeg_helper import ensure_ffmpeg_or_raise
 
 logger = get_logger(__name__)
@@ -148,9 +149,9 @@ def update_proxy_config(data: ProxyConfigRequest):
 
 
 # ---- Whisper 模型下载状态 & 下载触发 ----
-
-# 用于跟踪正在进行的下载任务
-_downloading: dict[str, str] = {}  # model_size -> status ("downloading" | "done" | "failed")
+# 下载状态（downloading / done / failed + 失败原因）统一交给 model_download_state 维护，
+# 「触发下载」与「查询状态」共享同一份进程内内存态。失败原因会随状态接口透传给前端，
+# 修复 issue #402 衍生问题：原先只回传 downloading/downloaded，下载失败时前端无任何提示。
 
 
 def _check_whisper_model_exists(model_size: str, subdir: str = "whisper") -> bool:
@@ -212,12 +213,7 @@ def get_transcriber_models_status():
     statuses = []
     for size in get_registry().visible_model_names():
         downloaded = _check_whisper_model_exists(size, "whisper")
-        download_status = _downloading.get(size)
-        statuses.append({
-            "model_size": size,
-            "downloaded": downloaded,
-            "downloading": download_status == "downloading",
-        })
+        statuses.append(dl_state.status_row(size, downloaded))
 
     # 也检查 mlx-whisper（仅 macOS）
     mlx_available = platform.system() == "Darwin"
@@ -225,16 +221,12 @@ def get_transcriber_models_status():
     if mlx_available:
         from app.transcriber.mlx_whisper_transcriber import MLX_MODEL_MAP
         for size in WHISPER_MODEL_SIZES:
-            mlx_key = f"mlx-{size}"
             repo_id = MLX_MODEL_MAP.get(size)
             # 用 config.json 判定，和 _check_mlx_whisper_model_exists / 加载逻辑保持一致
             downloaded = _check_mlx_whisper_model_exists(size)
-            mlx_statuses.append({
-                "model_size": size,
-                "downloaded": downloaded,
-                "downloading": _downloading.get(mlx_key) == "downloading",
-                "available": repo_id is not None,
-            })
+            row = dl_state.status_row(size, downloaded, key=f"mlx-{size}")
+            row["available"] = repo_id is not None
+            mlx_statuses.append(row)
 
     return R.success(data={
         "whisper": statuses,
@@ -248,6 +240,38 @@ class ModelDownloadRequest(BaseModel):
     transcriber_type: str = "fast-whisper"  # "fast-whisper" 或 "mlx-whisper"
 
 
+def _friendly_download_error(e: Exception) -> str:
+    """把 HuggingFace 的网络类报错翻译成用户能照着做的提示（issue #417）。
+
+    典型原文：'An error happened while trying to locate the file on the Hub and we
+    cannot find the requested files in the local cache...' —— 本质是连不上 Hub。
+    用户大概率不知道：默认走 hf-mirror.com 镜像，可配代理或改 HF_ENDPOINT。
+    """
+    raw = str(e)
+    lowered = raw.lower()
+    network_markers = (
+        "locate the file on the hub",
+        "couldn't connect",
+        "connection error",
+        "connecttimeout",
+        "read timed out",
+        "max retries exceeded",
+        "failed to establish",
+        "name or service not known",
+        "temporary failure in name resolution",
+    )
+    if any(m in lowered for m in network_markers):
+        endpoint = os.getenv("HF_ENDPOINT", "https://huggingface.co")
+        return (
+            f"{raw}\n"
+            f"——连不上模型仓库（当前 HF_ENDPOINT={endpoint}）。可尝试："
+            f"1) 在「设置」里配置可用代理；"
+            f"2) 设置环境变量 HF_ENDPOINT 切换镜像（国内可用 https://hf-mirror.com）；"
+            f"3) 确认容器能访问外网/镜像站后重试。"
+        )
+    return raw
+
+
 def _do_download_whisper(model_size: str):
     """后台下载 faster-whisper 模型（支持内置 size / 自定义 repo_id / 本地路径）。
 
@@ -258,23 +282,31 @@ def _do_download_whisper(model_size: str):
     """
     from huggingface_hub import snapshot_download
     from app.transcriber.whisper_models import resolve_whisper_model, is_local_target
+    from app.services.proxy_config_manager import ProxyConfigManager
 
     try:
-        _downloading[model_size] = "downloading"
+        dl_state.mark_downloading(model_size)
+        # 让 UI 配的代理对 HuggingFace 下载也生效（issue #417：容器里代理没生效）
+        proxy = ProxyConfigManager().apply_to_env()
+        if proxy:
+            logger.info(f"whisper 下载走代理: {proxy}")
         model_dir = get_model_dir("whisper")
 
         # 已经下好就不重复下
         if _check_whisper_model_exists(model_size, "whisper"):
-            _downloading[model_size] = "done"
+            dl_state.mark_done(model_size)
             return
 
         target = resolve_whisper_model(model_size)
         if is_local_target(target):
             # 本地模型不下载，只校验 model.bin 是否就位
             ok = (Path(target) / "model.bin").exists()
-            _downloading[model_size] = "done" if ok else "failed"
-            if not ok:
-                logger.warning(f"本地模型 {model_size} 路径 {target} 下没有 model.bin，无法使用")
+            if ok:
+                dl_state.mark_done(model_size)
+            else:
+                msg = f"本地模型路径 {target} 下没有 model.bin，无法使用"
+                logger.warning(f"本地模型 {model_size}：{msg}")
+                dl_state.mark_failed(model_size, msg)
             return
 
         logger.info(f"开始下载 whisper 模型: {model_size} ← {target}")
@@ -292,40 +324,48 @@ def _do_download_whisper(model_size: str):
             ],
         )
         logger.info(f"whisper 模型下载完成: {model_size}")
-        _downloading[model_size] = "done"
+        dl_state.mark_done(model_size)
     except Exception as e:
+        msg = _friendly_download_error(e)
         logger.error(f"whisper 模型下载失败: {model_size}, {e}")
-        _downloading[model_size] = "failed"
+        dl_state.mark_failed(model_size, msg)
 
 
 def _do_download_mlx_whisper(model_size: str):
     """后台下载 mlx-whisper 模型。"""
     key = f"mlx-{model_size}"
     try:
-        _downloading[key] = "downloading"
+        dl_state.mark_downloading(key)
         from huggingface_hub import snapshot_download as hf_download
         from app.transcriber.mlx_whisper_transcriber import resolve_mlx_repo_id
+        from app.services.proxy_config_manager import ProxyConfigManager
+
+        # 让 UI 配的代理对 HuggingFace 下载也生效（issue #417）
+        proxy = ProxyConfigManager().apply_to_env()
+        if proxy:
+            logger.info(f"mlx-whisper 下载走代理: {proxy}")
 
         try:
             repo_id = resolve_mlx_repo_id(model_size)
         except ValueError as e:
             logger.error(str(e))
-            _downloading[key] = "failed"
+            dl_state.mark_failed(key, str(e))
             return
 
         model_dir = get_model_dir("mlx-whisper")
         model_path = os.path.join(model_dir, repo_id)
         # 用 config.json 判定而非目录存在：半成品目录不能算「已下载」
         if (Path(model_path) / "config.json").exists():
-            _downloading[key] = "done"
+            dl_state.mark_done(key)
             return
         logger.info(f"开始下载 mlx-whisper 模型: {model_size} ← {repo_id}")
         hf_download(repo_id, local_dir=model_path, local_dir_use_symlinks=False)
         logger.info(f"mlx-whisper 模型下载完成: {model_size}")
-        _downloading[key] = "done"
+        dl_state.mark_done(key)
     except Exception as e:
+        msg = _friendly_download_error(e)
         logger.error(f"mlx-whisper 模型下载失败: {model_size}, {e}")
-        _downloading[key] = "failed"
+        dl_state.mark_failed(key, msg)
 
 
 @router.post("/transcriber_download")
@@ -338,7 +378,7 @@ def download_transcriber_model(data: ModelDownloadRequest, background_tasks: Bac
         if platform.system() != "Darwin":
             return R.error(msg="MLX Whisper 仅支持 macOS")
         key = f"mlx-{data.model_size}"
-        if _downloading.get(key) == "downloading":
+        if dl_state.is_downloading(key):
             return R.success(msg="模型正在下载中")
         background_tasks.add_task(_do_download_mlx_whisper, data.model_size)
     else:
@@ -346,7 +386,7 @@ def download_transcriber_model(data: ModelDownloadRequest, background_tasks: Bac
         from app.transcriber.whisper_models import get_registry
         if not get_registry().is_known(data.model_size):
             return R.error(msg=f"不支持的模型: {data.model_size}（请先在自定义模型中登记）")
-        if _downloading.get(data.model_size) == "downloading":
+        if dl_state.is_downloading(data.model_size):
             return R.success(msg="模型正在下载中")
         background_tasks.add_task(_do_download_whisper, data.model_size)
 
